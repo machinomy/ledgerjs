@@ -20,6 +20,10 @@
 import { splitPath, foreach } from "./utils";
 import { EthAppPleaseEnableContractData } from "@ledgerhq/errors";
 import type Transport from "@ledgerhq/hw-transport";
+const BigNumber = require('bignumber.js');
+const util = require('ethereumjs-util')
+
+const numberToBN = require('number-to-bn')
 
 const remapTransactionRelatedErrors = e => {
   if (e && e.statusCode === 0x6a80) {
@@ -279,5 +283,150 @@ eth.signPersonalMessage("44'/60'/0'/0/0", Buffer.from("test").toString("hex")).t
       const s = response.slice(1 + 32, 1 + 32 + 32).toString("hex");
       return { v, r, s };
     });
+  }
+
+  // EIP712
+  // No embedded objects for now, only plain values like uin256
+  signTypedData (
+      path: string,
+      domainData: string,
+      types: string,
+      data: string,
+      messageHex: string = '' // for compatability
+  ): Promise<{
+    v: number,
+    s: string,
+    r: string
+  }> {
+    let paths = splitPath(path);
+    let offset = 0;
+    let message = new Buffer(messageHex, "hex");
+    let toSend = [];
+    let response;
+    const typesAsMap = new Map(Object.values(JSON.parse(types)).map(e => [e.name, e.type]))
+    const typesKeysArray = Array.from(typesAsMap.keys())
+    const dataAsMap = new Map(Object.entries(JSON.parse(data)))
+    const dataKeysArray = Array.from(dataAsMap.keys())
+    const dataAsMapSize = dataAsMap.size
+
+    let pathsRecored = false
+    let countRecorded = false
+    let dataKeysIndex = 0
+    while (dataKeysIndex < dataAsMapSize) {
+      let maxChunkSize = offset === 0 ? 150 - 1 - paths.length * 4 - 4 : 150;
+      let chunkSize = maxChunkSize
+          // offset + maxChunkSize > message.length
+          //     ? message.length - offset
+          //     : maxChunkSize;
+      let buffer = new Buffer(
+          offset === 0 ? 1 + paths.length * 4 + 4 + chunkSize : chunkSize
+      );
+      if (offset === 0) {
+        buffer[0] = paths.length;
+        paths.forEach((element, index) => {
+          buffer.writeUInt32BE(element, 1 + 4 * index);
+        });
+        // buffer.writeUInt32BE(message.length, 1 + 4 * paths.length);
+        // message.copy(
+        //     buffer,
+        //     1 + 4 * paths.length + 4,
+        //     offset,
+        //     offset + chunkSize
+        // );
+        pathsRecored = true
+      } else if (pathsRecored && !countRecorded) {
+        buffer.writeUInt32BE(dataAsMapSize, 0);
+        countRecorded = true
+      } else {
+        // we don't deal with chunked data for now. only fixed address (20 bytes) and uint256 (32 bytes).
+        // These sizes less than max chunk size for ledger === 255
+        let nameOfField = dataKeysArray[dataKeysIndex]
+        let nameOfFieldBuffer = Buffer.from(nameOfField.padEnd(32, '\0'))
+        let nameOfFieldEllipsis = nameOfField.length > 32 ? nameOfField.substring(0, length - 3) + "..." : nameOfField;
+        let typeOfField = typesAsMap.get(dataKeysArray[dataKeysIndex])
+        let typeOfFieldPadded = typeOfField.padEnd(8, '\0')
+        let typeOfFieldBuffer = Buffer.from(typeOfFieldPadded)
+        const sizeFieldInBytes = this._internal_getSizeOfValue(typesAsMap, dataAsMap, nameOfField)
+        const value = dataAsMap.get(nameOfField)
+        const valueBuffer = this._internal_valueToBuffer(value, typeOfField)
+
+        buffer.writeUInt32BE(sizeFieldInBytes);
+        nameOfFieldBuffer.copy(buffer, 4);
+        typeOfFieldBuffer.copy(buffer, 4 + 32);
+        valueBuffer.copy(buffer, 4 + 32 + 8)
+
+        dataKeysIndex++
+      }
+      toSend.push(buffer);
+      offset += chunkSize;
+    }
+    toSend.push(Buffer.from('af', 'hex'));
+    let fieldIndex = 0
+    return foreach(toSend, (data, i) => {
+      console.log('i = ' + i)
+          if (i === 0) {
+            return this.transport
+                .send(0xe0, 0x18, 0x00, 0x00, data)
+                .then(apduResponse => {
+                  response = apduResponse;
+                })
+          } else if (i === 1) {
+              return this.transport
+                  .send(0xe0, 0x18, 0xae, 0x00, data)
+                  .then(apduResponse => {
+                    response = apduResponse;
+                  })
+          } else if (i === toSend.length - 1) {
+            return this.transport
+                .send(0xe0, 0x18, 0xaf, 0x00, data)
+                .then(apduResponse => {
+                  response = apduResponse;
+                })
+          } else {
+            fieldIndex = i - 2
+            console.log('fieldIndex = ' + fieldIndex)
+            return this.transport
+                .send(0xe0, 0x18, 0xad, fieldIndex, data)
+                .then(apduResponse => {
+                  response = apduResponse;
+                })
+          }
+        }
+    ).then(() => {
+      const v = response[0];
+      const r = response.slice(1, 1 + 32).toString("hex");
+      const s = response.slice(1 + 32, 1 + 32 + 32).toString("hex");
+      return { v, r, s };
+    });
+  }
+
+   _internal_getSizeOfValue(mapTypes, mapValues, name) {
+     let typeOfField = mapTypes.get(name)
+     switch (typeOfField) {
+       case 'address': {
+         return 20
+       }
+       case 'uint256': {
+         return 32
+       }
+       default: {
+         return -1
+       }
+    }
+  }
+
+  _internal_valueToBuffer(value, type) {
+    switch (type) {
+      case 'address': {
+        return Buffer.from(value.slice(2))
+      }
+      case 'uint256': {
+        const res = util.setLengthLeft((util.toBuffer(numberToBN(new BigNumber(value)))), 32)
+        return res
+      }
+      default: {
+        return -1
+      }
+    }
   }
 }
